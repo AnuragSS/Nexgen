@@ -1,212 +1,252 @@
-import geopandas as gpd
-import pandas as pd
-import folium
-import branca.colormap as cm
 from pathlib import Path
 
-# ================= 0. Configuration Paths =================
+import branca.colormap as cm
+import folium
+import geopandas as gpd
+import pandas as pd
+
+# ================= 0. Configuration & Paths =================
 bound_path = Path("CAUTH_MAY_2025_EN_BSC_1271049543973882786.geojson")
 brownfield_path = Path("brownfield-land.geojson")
 lsoa_path = Path("Lower_layer_Super_Output_Areas_December_2021_Boundaries_EW_BSC_V4_-4299016806856585929.geojson")
-
-# Excel Paths
 fuel_excel_path = Path("Sub-regional_fuel_poverty_statistics_2023.xlsx")
 imd_excel_path = Path("Deprivation_2025.xlsx")
+police_dir = Path("police_data")
 
 # ================= 1. Process Administrative Boundaries (LCR) =================
-print("1/6 Reading administrative boundary data...")
+print("1/7 Reading administrative boundary data...")
 bound_gdf = gpd.read_file(bound_path)
 if bound_gdf.crs is None or bound_gdf.crs.to_epsg() != 4326:
-    bound_gdf = bound_gdf.to_crs(epsg=4326)
+	bound_gdf = bound_gdf.to_crs(epsg=4326)
 
 # Filter for Liverpool City Region
 lcr = bound_gdf[bound_gdf["CAUTH25NM"] == "Liverpool City Region"].copy()
 if lcr.empty:
-    raise ValueError("LCR boundary not found, please check the data.")
+	raise ValueError("LCR boundary not found. Please check the Combined Authority GeoJSON.")
 
 centre = lcr.geometry.unary_union.centroid
 centre_lat, centre_lon = centre.y, centre.x
 
 # ================= 2. Process LSOA Spatial Data =================
-print("2/6 Reading and filtering LSOA spatial data...")
+print("2/7 Reading and filtering LSOA spatial data...")
 lsoa_gdf = gpd.read_file(lsoa_path)
 if lsoa_gdf.crs is None or lsoa_gdf.crs.to_epsg() != 4326:
-    lsoa_gdf = lsoa_gdf.to_crs(epsg=4326)
+	lsoa_gdf = lsoa_gdf.to_crs(epsg=4326)
 
 # Spatial filter: Keep only LSOAs within LCR
+# We keep LSOA21CD (Code) and LSOA21NM (Name)
 lsoa_lcr = gpd.sjoin(
-    lsoa_gdf,
-    lcr[["geometry"]],
-    how="inner",
-    predicate="intersects"
-)
+	lsoa_gdf,
+	lcr[["geometry"]],
+	how="inner",
+	predicate="intersects"
+).drop(columns=['index_right'])
 
-# ================= 3. Load & Clean Dataset A: Fuel Poverty =================
-print("3/6 Processing Fuel Poverty Data...")
+# Create a set of valid LCR LSOA codes for filtering the massive police data later
+valid_lsoa_codes = set(lsoa_lcr['LSOA21CD'].unique())
+
+# ================= 3. Load Dataset A: Fuel Poverty =================
+print("3/7 Processing Fuel Poverty Data...")
 try:
-    # Sheet "Table 4", Header at index 2 (Row 3)
-    fuel_data = pd.read_excel(fuel_excel_path, sheet_name="Table 4", header=2)
-    
-    # Select and Rename Columns
-    fuel_cols = {
-        "LSOA Code": "LSOA21CD", 
-        "Proportion of households fuel poor (%)": "Fuel_Poverty_Rate"
-    }
-    # Keep only columns that exist
-    valid_cols = [c for c in fuel_cols.keys() if c in fuel_data.columns]
-    fuel_data = fuel_data[valid_cols].rename(columns=fuel_cols)
-    
-    # Convert to numeric
-    fuel_data["Fuel_Poverty_Rate"] = pd.to_numeric(fuel_data["Fuel_Poverty_Rate"], errors="coerce")
-    
+	fuel_data = pd.read_excel(fuel_excel_path, sheet_name="Table 4", header=2)
+	fuel_data = fuel_data.rename(columns={
+		"LSOA Code"                             : "LSOA21CD",
+		"Proportion of households fuel poor (%)": "Fuel_Poverty_Rate"
+	})
+	fuel_data["Fuel_Poverty_Rate"] = pd.to_numeric(fuel_data["Fuel_Poverty_Rate"], errors="coerce")
+	fuel_data = fuel_data[["LSOA21CD", "Fuel_Poverty_Rate"]]
 except Exception as e:
-    print(f"Error loading Fuel Poverty data: {e}")
-    fuel_data = pd.DataFrame(columns=["LSOA21CD", "Fuel_Poverty_Rate"]) # Empty fallback
+	print(f"Warning: Fuel Poverty data error: {e}")
+	fuel_data = pd.DataFrame(columns=["LSOA21CD", "Fuel_Poverty_Rate"])
 
-# ================= 4. Load & Clean Dataset B: IMD Deprivation =================
-print("4/6 Processing IMD Deprivation Data...")
+# ================= 4. Load Dataset B: IMD Deprivation =================
+print("4/7 Processing IMD Deprivation Data...")
 try:
-    # Sheet "IMD25", Header at index 0 (Row 1)
-    imd_data = pd.read_excel(imd_excel_path, sheet_name="IMD25", header=0)
-    
-    # Find the specific Decile column
-    imd_col_name = "Index of Multiple Deprivation (IMD) Decile (where 1 is most deprived 10% of LSOA)"
-    if imd_col_name not in imd_data.columns:
-        # Fallback search
-        cols = [c for c in imd_data.columns if "Decile" in str(c) and "IMD" in str(c)]
-        imd_col_name = cols[0] if cols else None
+	imd_data = pd.read_excel(imd_excel_path, sheet_name="IMD25", header=0)
+	# Search for Decile column
+	imd_col = next((c for c in imd_data.columns if "Decile" in str(c) and "IMD" in str(c)), None)
 
-    if imd_col_name:
-        imd_cols = {
-            "LSOA code (2021)": "LSOA21CD", 
-            imd_col_name: "IMD_Decile"
-        }
-        imd_data = imd_data[list(imd_cols.keys())].rename(columns=imd_cols)
-        imd_data["IMD_Decile"] = pd.to_numeric(imd_data["IMD_Decile"], errors="coerce")
-    else:
-        raise ValueError("IMD Decile column not found.")
-        
+	if imd_col:
+		imd_data = imd_data.rename(columns={"LSOA code (2021)": "LSOA21CD", imd_col: "IMD_Decile"})
+		imd_data["IMD_Decile"] = pd.to_numeric(imd_data["IMD_Decile"], errors="coerce")
+		imd_data = imd_data[["LSOA21CD", "IMD_Decile"]]
+	else:
+		imd_data = pd.DataFrame(columns=["LSOA21CD", "IMD_Decile"])
 except Exception as e:
-    print(f"Error loading IMD data: {e}")
-    imd_data = pd.DataFrame(columns=["LSOA21CD", "IMD_Decile"])
+	print(f"Warning: IMD data error: {e}")
+	imd_data = pd.DataFrame(columns=["LSOA21CD", "IMD_Decile"])
 
-# ================= 5. Merge Data into Spatial GeoDataFrame =================
-print("5/6 Merging datasets...")
+# ================= 5. Load Dataset C: POLICE DATA (Complex) =================
+print("5/7 Processing Police Data (This may take a moment)...")
 
-# Merge Fuel Poverty
-lsoa_merged = lsoa_lcr.merge(fuel_data, on="LSOA21CD", how="left")
+street_counts = {}  # Dictionary to aggregate crimes: {LSOA_CODE: count}
+stop_search_points = []  # List to hold lat/lon for spatial join later
 
-# Merge IMD
-lsoa_merged = lsoa_merged.merge(imd_data, on="LSOA21CD", how="left")
+# Recursively find all CSV files
+all_csvs = list(police_dir.rglob("*.csv"))
+print(f"   Found {len(all_csvs)} police data files. parsing...")
 
-# Handle NaNs for styling (fill with -1 or similar to color them grey)
-lsoa_merged["Fuel_Poverty_Rate"] = lsoa_merged["Fuel_Poverty_Rate"].fillna(0)
-lsoa_merged["IMD_Decile"] = lsoa_merged["IMD_Decile"].fillna(-1)
+for csv_file in all_csvs:
+	fname = csv_file.name.lower()
 
-# ================= 6. Mapping =================
-print("6/6 Generating Combined Map...")
+	try:
+		# --- CASE 1: Street Crime (Has LSOA Code column) ---
+		if "street" in fname:
+			# Only read necessary columns to save RAM
+			# Note: Column names in your sample are "LSOA code"
+			df = pd.read_csv(csv_file, usecols=["LSOA code"])
 
-m = folium.Map(
-    location=[centre_lat, centre_lon],
-    zoom_start=11,
-    tiles="CartoDB positron"
-)
+			# Filter rows where LSOA is in our LCR list
+			df_filtered = df[df["LSOA code"].isin(valid_lsoa_codes)]
 
-# --- Define Color Maps ---
+			# Aggregate
+			counts = df_filtered["LSOA code"].value_counts()
+			for code, count in counts.items():
+				street_counts[code] = street_counts.get(code, 0) + count
 
-# 1. Fuel Poverty Colormap (Yellow -> Red)
-fp_min, fp_max = lsoa_merged["Fuel_Poverty_Rate"].min(), lsoa_merged["Fuel_Poverty_Rate"].max()
-cmap_fp = cm.LinearColormap(
-    ['#ffffb2', '#fecc5c', '#fd8d3c', '#f03b20', '#bd0026'],
-    vmin=fp_min, vmax=fp_max,
-    caption="Fuel Poverty Rate (%)"
-)
+		# --- CASE 2: Stop and Search (Has Lat/Lon, NO LSOA Code) ---
+		elif "stop-and-search" in fname:
+			# Need Latitude and Longitude to spatially join to LSOA
+			df = pd.read_csv(csv_file, usecols=["Latitude", "Longitude"])
 
-# 2. IMD Colormap (Red -> Green, 1 is Bad)
-cmap_imd = cm.LinearColormap(
-    ['#d73027', '#fc8d59', '#fee08b', '#d9ef8b', '#91cf60', '#1a9850'],
-    vmin=1, vmax=10,
-    caption="IMD Decile (1=Most Deprived, 10=Least)"
-)
+			# Drop invalid coordinates
+			df = df.dropna(subset=["Latitude", "Longitude"])
 
-# --- Layer 1: Fuel Poverty ---
-# We use FeatureGroup with 'overlay=False' logic (handled by LayerControl)
-# But standard FeatureGroups overlap. We will let the user toggle.
-fg_fp = folium.FeatureGroup(name="Fuel Poverty (2023)", show=True)
+			# Pre-filter rough bounding box of Liverpool to speed up (optional but good)
+			# Rough LCR box: Lat 53.2 to 53.7, Lon -3.3 to -2.5
+			mask = (df['Latitude'].between(53.1, 53.8)) & (df['Longitude'].between(-3.4, -2.4))
+			df_trimmed = df[mask]
 
-folium.GeoJson(
-    lsoa_merged,
-    name="Fuel Poverty Polygons",
-    style_function=lambda x: {
-        "fillColor": cmap_fp(x["properties"]["Fuel_Poverty_Rate"]) if x["properties"]["Fuel_Poverty_Rate"] > 0 else "#cccccc",
-        "color": "white",
-        "weight": 0.5,
-        "fillOpacity": 0.5,
-    },
-    tooltip=folium.GeoJsonTooltip(
-        fields=["LSOA21NM", "Fuel_Poverty_Rate"],
-        aliases=["Area:", "Fuel Poverty %:"],
-        sticky=False
-    )
-).add_to(fg_fp)
-fg_fp.add_to(m)
+			if not df_trimmed.empty:
+				stop_search_points.append(df_trimmed)
 
-# --- Layer 2: IMD Deprivation ---
-fg_imd = folium.FeatureGroup(name="IMD Deprivation (2025)", show=False) # Hidden by default
+	except ValueError as ve:
+		# Happens if columns like 'LSOA code' are missing in a specific file
+		continue
+	except Exception as e:
+		print(f"   Skipped {fname}: {e}")
 
-folium.GeoJson(
-    lsoa_merged,
-    name="IMD Polygons",
-    style_function=lambda x: {
-        "fillColor": cmap_imd(x["properties"]["IMD_Decile"]) if x["properties"]["IMD_Decile"] > 0 else "#cccccc",
-        "color": "white",
-        "weight": 0.5,
-        "fillOpacity": 0.5,
-    },
-    tooltip=folium.GeoJsonTooltip(
-        fields=["LSOA21NM", "IMD_Decile"],
-        aliases=["Area:", "IMD Decile:"],
-        sticky=False
-    )
-).add_to(fg_imd)
-fg_imd.add_to(m)
+# --- Aggregate Street Crimes to DataFrame ---
+df_street = pd.DataFrame(list(street_counts.items()), columns=["LSOA21CD", "Crime_Count"])
 
-# --- Layer 3: Brownfield Sites (Always Top) ---
+# --- Process Stop & Search (Spatial Join) ---
+print("   Performing spatial join for Stop & Search data...")
+df_stop_agg = pd.DataFrame(columns=["LSOA21CD", "StopSearch_Count"])
+
+if stop_search_points:
+	# Combine all individual stop/search dataframes
+	all_stops = pd.concat(stop_search_points, ignore_index=True)
+
+	# Convert to GeoDataFrame
+	gdf_stops = gpd.GeoDataFrame(
+		all_stops,
+		geometry=gpd.points_from_xy(all_stops.Longitude, all_stops.Latitude),
+		crs="EPSG:4326"
+	)
+
+	# Spatial Join: Points WITHIN LSOA Polygons
+	# We join stops to the previously filtered 'lsoa_lcr'
+	stops_with_lsoa = gpd.sjoin(gdf_stops, lsoa_lcr[['LSOA21CD', 'geometry']], predicate='within')
+
+	# Count by LSOA
+	stop_counts = stops_with_lsoa['LSOA21CD'].value_counts().reset_index()
+	stop_counts.columns = ['LSOA21CD', 'StopSearch_Count']
+	df_stop_agg = stop_counts
+
+# ================= 6. Merge All Data =================
+print("6/7 Merging all datasets into Master GeoDataFrame...")
+
+# Start with Spatial LSOAs
+master_gdf = lsoa_lcr.merge(fuel_data, on="LSOA21CD", how="left")
+master_gdf = master_gdf.merge(imd_data, on="LSOA21CD", how="left")
+master_gdf = master_gdf.merge(df_street, on="LSOA21CD", how="left")
+master_gdf = master_gdf.merge(df_stop_agg, on="LSOA21CD", how="left")
+
+# Fill NaNs
+master_gdf["Fuel_Poverty_Rate"] = master_gdf["Fuel_Poverty_Rate"].fillna(0)
+master_gdf["IMD_Decile"] = master_gdf["IMD_Decile"].fillna(-1)  # -1 indicates no data
+master_gdf["Crime_Count"] = master_gdf["Crime_Count"].fillna(0)
+master_gdf["StopSearch_Count"] = master_gdf["StopSearch_Count"].fillna(0)
+
+# ================= 7. Mapping =================
+print("7/7 Generating Map...")
+
+m = folium.Map(location=[centre_lat, centre_lon], zoom_start=11, tiles="CartoDB positron")
+
+# --- Define Colormaps ---
+
+# 1. Fuel Poverty (Yellow -> Red)
+cmap_fp = cm.LinearColormap(['#ffffb2', '#fd8d3c', '#bd0026'],
+                            vmin=master_gdf["Fuel_Poverty_Rate"].min(),
+                            vmax=master_gdf["Fuel_Poverty_Rate"].max(),
+                            caption="Fuel Poverty (%)")
+
+# 2. IMD (Red -> Green)
+cmap_imd = cm.LinearColormap(['#d73027', '#fee08b', '#1a9850'],
+                             vmin=1, vmax=10,
+                             caption="IMD Decile (1=Deprived)")
+
+# 3. Crime Count (White -> Purple)
+# Use 95th percentile for max to avoid skewing by city centre hotspots
+crime_max = master_gdf["Crime_Count"].quantile(0.95)
+cmap_crime = cm.LinearColormap(['#fcfbfd', '#9e9ac8', '#3f007d'],
+                               vmin=0, vmax=crime_max,
+                               caption="Reported Crimes (2022-2025)")
+
+# 4. Stop & Search (White -> Orange)
+ss_max = master_gdf["StopSearch_Count"].quantile(0.95)
+cmap_ss = cm.LinearColormap(['#fff5eb', '#fd8d3c', '#7f2704'],
+                            vmin=0, vmax=ss_max,
+                            caption="Stop & Search Events")
+
+
+# --- Helper Function for Layers ---
+def add_layer(gdf, name, column, cmap, show=False):
+	fg = folium.FeatureGroup(name=name, show=show)
+	folium.GeoJson(
+		gdf,
+		style_function=lambda x: {
+			"fillColor"  : cmap(x["properties"][column]) if x["properties"][column] > 0 else "#f0f0f0",
+			"color"      : "transparent",
+			"weight"     : 0,
+			"fillOpacity": 0.6,
+		},
+		highlight_function=lambda x: {"weight": 2, "color": "#666", "fillOpacity": 0.8},
+		tooltip=folium.GeoJsonTooltip(
+			fields=["LSOA21NM", column],
+			aliases=["Area:", f"{name}:"],
+			sticky=False
+		)
+	).add_to(fg)
+	fg.add_to(m)
+	return cmap
+
+
+# Add Polygon Layers
+add_layer(master_gdf, "Fuel Poverty", "Fuel_Poverty_Rate", cmap_fp, show=True).add_to(m)
+add_layer(master_gdf, "IMD Deprivation", "IMD_Decile", cmap_imd, show=False).add_to(m)
+add_layer(master_gdf, "Total Crimes", "Crime_Count", cmap_crime, show=False).add_to(m)
+add_layer(master_gdf, "Stop & Search", "StopSearch_Count", cmap_ss, show=False).add_to(m)
+
+# --- Brownfield Sites (Points) ---
 brownfield = gpd.read_file(brownfield_path).to_crs(epsg=4326)
 bf_lcr = gpd.sjoin(brownfield, lcr[["geometry"]], predicate="within")
 bf_lcr["hectares"] = pd.to_numeric(bf_lcr["hectares"], errors="coerce")
 
 fg_sites = folium.FeatureGroup(name="Brownfield Sites", show=True)
-h_min, h_max = bf_lcr["hectares"].min(), bf_lcr["hectares"].max()
-# Blue/Cyan scale for contrast
-cmap_sites = cm.LinearColormap(["#2171b5", "#08306b"], vmin=h_min, vmax=h_max) 
-
 for _, row in bf_lcr.iterrows():
-    if row.geometry.is_empty or pd.isna(row["hectares"]): continue
-    
-    folium.CircleMarker(
-        location=[row.geometry.centroid.y, row.geometry.centroid.x],
-        radius=3 + 9 * (row["hectares"] - h_min) / (h_max - h_min + 1e-9),
-        color="#ffffff",
-        weight=1,
-        fillColor=cmap_sites(row["hectares"]),
-        fillOpacity=0.9,
-        popup=f"Site: {row.get('SiteName', 'N/A')}<br>Ha: {row['hectares']}"
-    ).add_to(fg_sites)
-
+	if row.geometry.is_empty or pd.isna(row["hectares"]): continue
+	folium.CircleMarker(
+		location=[row.geometry.centroid.y, row.geometry.centroid.x],
+		radius=3 + (row["hectares"] * 0.5),  # Scale radius
+		color="black", weight=1,
+		fillColor="#00bcd4", fillOpacity=0.8,
+		popup=f"Site: {row.get('SiteName', 'N/A')}<br>Ha: {row['hectares']}"
+	).add_to(fg_sites)
 fg_sites.add_to(m)
 
-# --- Add Legends ---
-# Note: In standard Folium, legends are static. Both will appear on the map.
-cmap_fp.add_to(m)
-cmap_imd.add_to(m)
-
-# --- Add Controls ---
-# LayerControl allows toggling layers on/off
+# --- Finalize ---
 folium.LayerControl(collapsed=False).add_to(m)
-
-# --- Save ---
-outfile = "LCR_Combined_Map.html"
+outfile = "LCR_Integrated_Map.html"
 m.save(outfile)
-print(f"Map saved successfully to: {outfile}")
-print("Open the HTML file and use the Layer Control (top right) to switch between Fuel Poverty and IMD.")
+print(f"Done! Map saved to {outfile}")
