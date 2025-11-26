@@ -743,3 +743,12 @@ $RECYCLE.BIN/
 *.lnk
 
 # End of https://www.toptal.com/developers/gitignore/api/windows,macos,linux,python,jupyternotebooks,kate,visualstudiocode,pycharm,pycharm+iml,pycharm+all,jetbrains,jetbrains+all,jetbrains+iml,vim,notepadpp,gis,microsoftoffice
+
+[Bb]in
+[Ii]nclude
+[Ll]ib
+[Ll]ib64
+[Ll]ocal
+[Ss]cripts
+pyvenv.cfg
+pip-selfcheck.json
